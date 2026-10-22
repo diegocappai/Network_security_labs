@@ -1,1 +1,174 @@
+import asyncio
+import ssl
+import json
+import hashlib
+import threading
+import http.server
+from typing import Callable, Dict, Optional
 
+from aioquic.asyncio import serve, QuicConnectionProtocol
+from aioquic.h3.connection import H3_ALPN, H3Connection
+from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import QuicEvent
+
+HOST = "10.8.0.32"
+PORT = 4433
+
+# ==========================================
+# 1. SERVER CLASSICO HTTPS (TCP / HTTP/1.1)
+# ==========================================
+class TCPHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            # Regola: inserire l'header Alt-Svc per informare il client che esiste HTTP/3
+            self.send_header('Alt-Svc', 'h3=":4433"')
+            self.end_headers()
+            self.wfile.write(b"OK")
+            
+        elif self.path == '/proto':
+            self.send_response(200)
+            self.send_header('Alt-Svc', 'h3=":4433"')
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            # Correzione: risponde esattamente con la versione HTTP usata dal client
+            # BaseHTTPRequestHandler memorizza la versione in self.request_version (es. "HTTP/1.1")
+            self.wfile.write(self.request_version.encode('utf-8'))
+            
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_tcp_server():
+    server_address = (HOST, PORT)
+    httpd = http.server.HTTPServer(server_address, TCPHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
+    context.set_alpn_protocols(["http/1.1"])
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    print(f"[*] Server HTTPS (TCP) in ascolto sulla porta {PORT}...")
+    httpd.serve_forever()
+
+
+# ==========================================
+# 2. SERVER QUIC (UDP / HTTP/3)
+# ==========================================
+class HttpRequestHandler:
+    def __init__(self, authority: bytes, stream_id: int, transmit: Callable[[], None], protocol_version: str):
+        self.authority = authority
+        self.stream_id = stream_id
+        self.transmit = transmit
+        self.protocol_version = protocol_version
+        self.method = ""
+        self.path = ""
+        self.headers: list[tuple[bytes, bytes]] = []
+        self.body = bytearray()
+
+    def process_headers(self, event: HeadersReceived) -> None:
+        self.headers = event.headers
+        for name, value in self.headers:
+            if name == b":method":
+                self.method = value.decode()
+            elif name == b":path":
+                self.path = value.decode()
+
+    def process_data(self, event: DataReceived) -> None:
+        self.body.extend(event.data)
+
+    def generate_response(self, h3_conn: H3Connection) -> None:
+        response_headers = []
+        response_body = b""
+        status_code = b"404"
+
+        if self.method == "GET" and self.path == "/":
+            status_code = b"200"
+            response_body = b"OK"
+            response_headers.append((b"alt-svc", b'h3=":4433"'))
+            
+        elif self.method == "GET" and self.path == "/proto":
+            status_code = b"200"
+            # Regola: se contattato via QUIC, risponde "HTTP/3 over QUIC"
+            response_body = self.protocol_version.encode('utf-8')
+            response_headers.append((b"alt-svc", b'h3=":4433"'))
+
+        elif self.method == "POST" and self.path == "/hash":
+            status_code = b"200"
+            hash_hex = hashlib.sha256(self.body).hexdigest()
+            response_body = hash_hex.encode('utf-8')
+
+        response_headers.insert(0, (b":status", status_code))
+        response_headers.append((b"content-length", str(len(response_body)).encode()))
+        
+        h3_conn.send_headers(stream_id=self.stream_id, headers=response_headers)
+        h3_conn.send_data(stream_id=self.stream_id, data=response_body, end_stream=True)
+        self.transmit()
+
+class Http3ServerProtocol(QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._http: Optional[H3Connection] = None
+        self._requests: Dict[int, HttpRequestHandler] = {}
+
+    def quic_event_received(self, event: QuicEvent) -> None:
+        if self._http is None:
+            self._http = H3Connection(self._quic)
+
+        for h3_event in self._http.handle_event(event):
+            self.h3_event_received(h3_event)
+
+    def h3_event_received(self, event: H3Event) -> None:
+        if isinstance(event, HeadersReceived):
+            protocol_name = "HTTP/3"
+            request = HttpRequestHandler(
+                authority=b"server.netsec.lab",
+                stream_id=event.stream_id,
+                transmit=self.transmit,
+                protocol_version=protocol_name
+            )
+            request.process_headers(event)
+            self._requests[event.stream_id] = request
+            
+            if event.stream_ended:
+                request.generate_response(self._http)
+                del self._requests[event.stream_id]
+
+        elif isinstance(event, DataReceived):
+            request = self._requests.get(event.stream_id)
+            if request:
+                request.process_data(event)
+                if event.stream_ended:
+                    request.generate_response(self._http)
+                    del self._requests[event.stream_id]
+
+# ==========================================
+# 3. AVVIO COMBINATO
+# ==========================================
+async def main():
+    # 1. Avvia il server HTTPS (TCP) in background usando un Thread separato
+    tcp_thread = threading.Thread(target=run_tcp_server, daemon=True)
+    tcp_thread.start()
+
+    # 2. Configura e avvia il server QUIC (UDP) nel thread principale
+    configuration = QuicConfiguration(
+        alpn_protocols=H3_ALPN,
+        is_client=False,
+    )
+    configuration.load_cert_chain("cert.pem", "key.pem")
+
+    print(f"[*] Server HTTP/3 QUIC (UDP) in ascolto sulla porta {PORT}...")
+    await serve(
+        HOST,
+        PORT,
+        configuration=configuration,
+        create_protocol=Http3ServerProtocol,
+    )
+
+    # Mantiene vivo il processo
+    await asyncio.Future()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[*] Server fermati.")
