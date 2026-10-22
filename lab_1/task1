@@ -1,1 +1,37 @@
+# SERVER
 
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    s.bind(("10.8.0.46", 9001))
+    s.listen()
+    print("Server in ascolto sulla porta 9001...")
+
+	
+    conn, addr = s.accept()
+    with conn:
+        print(f"Connesso a: {addr}")
+        while True:
+            data = conn.recv(1024)
+            if not data: break
+            conn.sendall(data)
+
+# CLIENT
+import socket
+
+HOST = "127.0.0.1"
+PORT = 9001
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    print("Tentativo di connessione al server...")
+    s.connect((HOST, PORT))
+    print("Connesso con successo!\n")
+    
+    # Inviamo un comando corretto, maiuscolo e con \n alla fine
+    comando = "CIAO\n"
+    print(f"Invio il comando: {comando.strip()}")
+    s.sendall(comando.encode('ascii'))
+    
+    # Riceviamo e stampiamo la risposta
+    risposta = s.recv(1024).decode('ascii')
+    print(f"Il server ha risposto: {risposta.strip()}")
