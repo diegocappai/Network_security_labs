@@ -1,1 +1,53 @@
+import http.server
+from urllib.parse import urlparse
 
+HOST = "0.0.0.0"
+PORT = 8090 # La porta richiesta per la connessione VPN
+
+# Variabile globale che fa da "shared state" tra Tor e VPN[cite: 29]
+last_token = ""
+
+class OnionHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        global last_token
+        
+        # 1. Onion site: GET / -> 200[cite: 29]
+        if self.path == '/':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Onion Service Attivo")
+            
+        # 2. Proof of ownership: GET /claim -> the last token received[cite: 29]
+        elif self.path == '/claim':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(last_token.encode('utf-8'))
+            
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        global last_token
+        
+        # 2. Proof of ownership: POST /claim with token -> 200[cite: 29]
+        if self.path == '/claim':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            
+            # Salva il token in formato testo
+            last_token = body.decode('utf-8')
+            
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Token salvato con successo")
+            
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+if __name__ == '__main__':
+    server = http.server.HTTPServer((HOST, PORT), OnionHandler)
+    print(f"[*] Server Onion/VPN in ascolto sulla porta {PORT}...")
+    server.serve_forever()
