@@ -1,1 +1,116 @@
+import http.server
+import ssl
+import json
+import uuid
+from urllib.parse import urlparse
+from http import cookies
 
+HOST = "0.0.0.0"
+PORT = 8443
+
+# Dizionario per memorizzare le sessioni: { "id_sessione": "nome_utente" }
+sessions = {}
+
+class SecureAPIHandler(http.server.BaseHTTPRequestHandler):
+    
+    # Metodo di supporto per leggere il cookie di sessione
+    def get_session_id(self):
+        if 'Cookie' in self.headers:
+            # Analizza l'header Cookie
+            c = cookies.SimpleCookie(self.headers.get('Cookie'))
+            if 'session_id' in c:
+                return c['session_id'].value
+        return None
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        
+        # --- Regola 1: GET / -> 200 ---[cite: 21]
+        if path == '/':
+            self.send_response(200)
+            self.end_headers()
+            
+        # --- Regola 3: GET /me ---[cite: 21]
+        elif path == '/me':
+            session_id = self.get_session_id()
+            
+            # Verifica se il cookie c'è ed è valido nel nostro dizionario
+            if session_id and session_id in sessions:
+                user = sessions[session_id]
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"user": user}).encode('utf-8')) # Risponde 200 e {"user": "<name>"}[cite: 21]
+            else:
+                self.send_response(401) # without a valid cookie -> 401[cite: 21]
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        
+        # --- Regola 2: POST /login ---[cite: 21]
+        if path == '/login':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            
+            try:
+                data = json.loads(body.decode('utf-8'))
+                user = data.get('user')
+                password = data.get('password')
+                
+                # Se la password è corretta[cite: 21]
+                if password == "netsec":
+                    # Crea un ID di sessione univoco e salva l'utente
+                    session_id = str(uuid.uuid4())
+                    sessions[session_id] = user
+                    
+                    # Crea il cookie con gli attributi richiesti[cite: 21]
+                    c = cookies.SimpleCookie()
+                    c['session_id'] = session_id
+                    c['session_id']['Secure'] = True # Richiesto dall'esercizio[cite: 21]
+                    c['session_id']['HttpOnly'] = True # Richiesto dall'esercizio[cite: 21]
+                    c['session_id']['Path'] = '/'
+                    
+                    self.send_response(200)
+                    # Aggiunge l'header Set-Cookie alla risposta HTTP
+                    self.send_header('Set-Cookie', c['session_id'].OutputString())
+                    self.end_headers()
+                    
+                else:
+                    # wrong password -> 401, without setting any cookie[cite: 21]
+                    self.send_response(401)
+                    self.end_headers()
+                    
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_https_server():
+    server_address = (HOST, PORT)
+    httpd = http.server.HTTPServer(server_address, SecureAPIHandler)
+    
+    # --- Configurazione TLS ---
+    # Creiamo il contesto crittografico per il server
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # Carichiamo il certificato e la chiave privata che abbiamo generato
+    context.load_cert_chain(certfile="cert.pem", keyfile="key.pem")
+    
+    # "Avvolgiamo" il socket HTTP normale dentro il contesto crittografato
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    
+    print(f"[*] Server HTTPS in ascolto sulla porta {PORT}...")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    httpd.server_close()
+    print("[*] Server fermato.")
+
+if __name__ == '__main__':
+    run_https_server()
